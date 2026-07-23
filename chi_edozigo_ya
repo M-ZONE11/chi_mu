@@ -1,0 +1,530 @@
+Repository layout (top-level)
+- README.md
+- .gitignore
+- requirements.txt
+- config/config.yaml
+- Dockerfile
+- .github/workflows/ci.yml
+- scripts/
+- run_pipeline.py
+- train_model.py
+- src/
+- __init__.py
+- utils/
+- io.py
+- logging.py
+- data_pipeline/
+- ingest.py
+- features/
+- engineer.py
+- ml/
+- train.py
+- predict.py
+- strategy/
+- baseline.py
+- ml_strategy.py
+- backtest/
+- backtest.py
+- models/ (empty; models are saved here by training script)
+- data/ (empty; ingestion writes here)
+- results/ (empty; backtest outputs)
+- tests/
+- test_features.py
+
+
+
+
+
+
+
+
+--- File contents ---
+
+README.md
+```
+# chi_edozigo_ya
+
+Crypto trading AI skeleton:
+- Data ingestion (CCXT -> parquet)
+- Feature engineering
+- Baseline SMA strategy
+- ML training pipeline (XGBoost + scikit-learn preprocessing) with joblib model saving
+- Backtesting with vectorbt
+- Paper / live mode toggles (use paper mode for testing)
+
+Quickstart (local)
+1. python3 -m venv venv && source venv/bin/activate
+2. pip install -r requirements.txt
+3. Edit config/config.yaml
+4. Run end-to-end (paper mode):
+python scripts/run_pipeline.py
+
+Train model only:
+python scripts/train_model.py
+
+Model artifacts saved to models/
+
+Security
+- Do NOT commit API keys. Use environment variables for secrets.
+- This repo is a starting point. Do thorough testing before any live trading.
+
+Structure
+- src/data_pipeline: fetch & store OHLCV
+- src/features: feature engineering and labeling
+- src/ml: training and prediction utilities
+- src/strategy: baseline and ML strategy implementations
+- src/backtest: backtesting helpers
+```
+
+
+
+
+
+.gitignore
+```
+venv/
+__pycache__/
+*.pyc
+.env
+*.parquet
+results/
+models/
+data/
+.ipynb_checkpoints
+```
+
+
+
+
+
+requirements.txt
+```
+pandas>=1.5
+numpy
+ccxt
+pyarrow
+duckdb
+vectorbt
+matplotlib
+pyyaml
+pytest
+scikit-learn
+xgboost
+joblib
+fastapi
+uvicorn
+python-dotenv
+```
+
+
+
+
+config/config.yaml
+```
+mode: paper # paper | live | signal
+exchange: binance
+symbols:
+- BTC/USDT
+- ETH/USDT
+timeframe: 1h
+limit: 2000
+data_dir: data
+results_dir: results
+model_dir: models
+sma_short: 50
+sma_long: 200
+
+ml:
+label_horizon: 1 # number of candles ahead to predict
+test_size: 0.2
+random_state: 42
+xgb:
+n_estimators: 100
+max_depth: 6
+learning_rate: 0.1
+```
+
+
+
+
+
+
+Dockerfile
+```
+FROM python:3.10-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["python", "scripts/run_pipeline.py"]
+```
+
+
+
+
+.github/workflows/ci.yml
+```
+name: CI
+on: [push, pull_request]
+jobs:
+test:
+runs-on: ubuntu-latest
+steps:
+- uses: actions/checkout@v4
+- name: Setup Python
+uses: actions/setup-python@v4
+with:
+python-version: '3.10'
+- name: Install deps
+run: pip install -r requirements.txt
+- name: Run tests
+run: pytest -q
+```
+
+
+
+
+
+src/__init__.py
+```
+# package marker
+```
+
+src/utils/io.py
+```
+import os
+import pandas as pd
+import joblib
+from pathlib import Path
+
+def ensure_dir(path):
+if path:
+os.makedirs(path, exist_ok=True)
+
+def save_parquet(df: pd.DataFrame, path: str):
+ensure_dir(os.path.dirname(path))
+df.to_parquet(path, index=True)
+
+def load_parquet(path: str) -> pd.DataFrame:
+return pd.read_parquet(path)
+
+def save_model(obj, path: str):
+ensure_dir(os.path.dirname(path))
+joblib.dump(obj, path)
+
+def load_model(path: str):
+return joblib.load(path)
+```
+
+src/utils/logging.py
+```
+import logging
+def get_logger(name=__name__):
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+return logging.getLogger(name)
+```
+
+src/data_pipeline/ingest.py
+```
+import ccxt
+import pandas as pd
+from src.utils.io import save_parquet, ensure_dir
+from datetime import datetime
+from typing import Optional
+
+def ohlcv_to_df(ohlcv, columns=['timestamp','open','high','low','close','volume']):
+df = pd.DataFrame(ohlcv, columns=columns)
+df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+df.set_index('timestamp', inplace=True)
+return df
+
+def fetch_ohlcv(exchange_name: str, symbol: str, timeframe: str='1h', since: Optional[int]=None, limit: int=1000):
+ex_class = getattr(ccxt, exchange_name)
+ex = ex_class({'enableRateLimit': True})
+ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
+return ohlcv_to_df(ohlcv)
+
+def ingest_to_parquet(exchange: str, symbol: str, timeframe: str, limit: int, out_dir: str):
+df = fetch_ohlcv(exchange, symbol, timeframe=timeframe, limit=limit)
+path = f"{out_dir}/{exchange}/{symbol.replace('/','-')}/{timeframe}.parquet"
+save_parquet(df, path)
+return path
+```
+
+
+
+
+src/features/engineer.py
+```
+import pandas as pd
+import numpy as np
+
+def load_parquet(path):
+return pd.read_parquet(path)
+
+def add_basic_features(df: pd.DataFrame, sma_short=50, sma_long=200):
+df = df.copy()
+df['return'] = df['close'].pct_change()
+df['sma_short'] = df['close'].rolling(window=sma_short).mean()
+df['sma_long'] = df['close'].rolling(window=sma_long).mean()
+df['volatility'] = df['return'].rolling(window=20).std()
+df = df.dropna()
+return df
+
+def add_ml_labels(df: pd.DataFrame, horizon=1):
+"""
+Adds label columns for ML training:
+- future_return: percentage return after `horizon` periods
+- direction: 1 if future_return > 0 else 0
+"""
+df = df.copy()
+df['future_close'] = df['close'].shift(-horizon)
+df['future_return'] = (df['future_close'] - df['close']) / df['close']
+df['direction'] = (df['future_return'] > 0).astype(int)
+df = df.dropna()
+return df
+```
+
+
+
+
+src/ml/train.py
+```
+import yaml
+import os
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, accuracy_score
+from xgboost import XGBClassifier
+from src.utils.io import save_model, load_parquet
+from src.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+def train_model(feature_parquet_path: str, config_path: str = 'config/config.yaml'):
+cfg = yaml.safe_load(open(config_path))
+model_dir = cfg.get('model_dir', 'models')
+ml_cfg = cfg.get('ml', {})
+label_horizon = ml_cfg.get('label_horizon', 1)
+test_size = ml_cfg.get('test_size', 0.2)
+rs = ml_cfg.get('random_state', 42)
+
+logger.info(f'Loading features from {feature_parquet_path}')
+df = load_parquet(feature_parquet_path)
+# require label exists
+if 'direction' not in df.columns:
+raise ValueError('Dataframe must contain a "direction" label column. Run add_ml_labels first.')
+
+feature_cols = [c for c in df.columns if c not in ['future_close','future_return','direction']]
+X = df[feature_cols].astype(float)
+y = df['direction'].astype(int)
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=rs, stratify=y)
+
+logger.info('Building pipeline...')
+xgb_params = ml_cfg.get('xgb', {})
+pipeline = Pipeline([
+('scaler', StandardScaler()),
+('xgb', XGBClassifier(use_label_encoder=False, eval_metric='logloss', **xgb_params))
+])
+
+logger.info('Training model...')
+pipeline.fit(X_train, y_train)
+
+preds = pipeline.predict(X_test)
+probs = pipeline.predict_proba(X_test)[:,1]
+acc = accuracy_score(y_test, preds)
+logger.info('Test accuracy: %.4f', acc)
+logger.info('Classification report:\n%s', classification_report(y_test, preds))
+
+# Save model with versioned filename
+Path(model_dir).mkdir(parents=True, exist_ok=True)
+model_path = os.path.join(model_dir, f"xgb_model_h{label_horizon}_rs{rs}.joblib")
+save_model(pipeline, model_path)
+logger.info('Model saved to %s', model_path)
+return model_path, {'accuracy': acc}
+```
+
+
+
+
+
+src/ml/predict.py
+```
+from src.utils.io import load_model
+import pandas as pd
+
+def predict_signals(model_path: str, feature_df: pd.DataFrame, threshold: float = 0.5):
+model = load_model(model_path)
+X = feature_df.copy()
+probs = model.predict_proba(X)[:,1]
+signals = (probs >= threshold).astype(bool)
+return signals, probs
+```
+
+
+
+
+src/strategy/baseline.py
+```
+import pandas as pd
+
+class SMACrossover:
+def __init__(self, short_col='sma_short', long_col='sma_long'):
+self.short_col = short_col
+self.long_col = long_col
+
+def generate_signals(self, df: pd.DataFrame):
+df = df.copy()
+# entry when short crosses above long
+entries = (df[self.short_col] > df[self.long_col]) & (df[self.short_col].shift(1) <= df[self.long_col].shift(1))
+exits = (df[self.short_col] < df[self.long_col]) & (df[self.short_col].shift(1) >= df[self.long_col].shift(1))
+entries = entries.astype(bool)
+exits = exits.astype(bool)
+return entries, exits
+```
+
+
+
+
+
+src/strategy/ml_strategy.py
+```
+import pandas as pd
+from src.ml.predict import predict_signals
+
+class MLSignalStrategy:
+def __init__(self, model_path: str, threshold: float = 0.5):
+self.model_path = model_path
+self.threshold = threshold
+
+def generate_signals(self, feature_df: pd.DataFrame):
+signals, probs = predict_signals(self.model_path, feature_df, threshold=self.threshold)
+# For vectorbt: entries as boolean Series; exits when signal flips to 0 or after fixed horizon
+entries = pd.Series(signals, index=feature_df.index).astype(bool)
+exits = (~entries).astype(bool)
+return entries, exits, probs
+```
+
+
+
+src/backtest/backtest.py
+```
+import vectorbt as vbt
+import pandas as pd
+from pathlib import Path
+
+def run_vectorbt_backtest(df: pd.DataFrame, entries: pd.Series, exits: pd.Series, results_dir: str, symbol: str):
+close = df['close']
+pf = vbt.Portfolio.from_signals(close, entries=entries, exits=exits, init_cash=10000, fees=0.0005, slippage=0.0005)
+Path(results_dir).mkdir(parents=True, exist_ok=True)
+metrics = {
+'total_return': float(pf.total_return()),
+'sharpe': float(pf.sharpe_ratio()),
+'max_drawdown': float(pf.max_drawdown()),
+'trades': int(pf.total_trades())
+}
+with open(f"{results_dir}/{symbol.replace('/','-')}_metrics.txt", 'w') as f:
+f.write(str(metrics))
+# save equity curve plot
+fig = pf.total_return().vbt.plot().figure
+fig.savefig(f"{results_dir}/{symbol.replace('/','-')}_equity.png")
+return pf, metrics
+```
+
+scripts/run_pipeline.py
+```
+import yaml
+import os
+from src.data_pipeline.ingest import ingest_to_parquet
+from src.features.engineer import load_parquet, add_basic_features, add_ml_labels
+from src.strategy.baseline import SMACrossover
+from src.strategy.ml_strategy import MLSignalStrategy
+from src.backtest.backtest import run_vectorbt_backtest
+from src.ml.train import train_model
+from src.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+def main():
+cfg = yaml.safe_load(open('config/config.yaml'))
+mode = cfg.get('mode', 'paper')
+exchange = cfg['exchange']
+symbols = cfg.get('symbols', ['BTC/USDT'])
+timeframe = cfg.get('timeframe', '1h')
+limit = cfg.get('limit', 1000)
+results_dir = cfg.get('results_dir', 'results')
+model_dir = cfg.get('model_dir', 'models')
+
+os.makedirs(results_dir, exist_ok=True)
+os.makedirs(model_dir, exist_ok=True)
+
+for symbol in symbols:
+logger.info(f"Ingesting {symbol}")
+path = ingest_to_parquet(exchange, symbol, timeframe, limit, cfg['data_dir'])
+df = load_parquet(path)
+features = add_basic_features(df, sma_short=cfg['sma_short'], sma_long=cfg['sma_long'])
+features = add_ml_labels(features, horizon=cfg['ml']['label_horizon'])
+
+# Train ML model (for demo purposes we train here; in production train offline)
+model_path, _ = train_model(path, config_path='config/config.yaml')
+
+# Use ML strategy signals
+ml_strategy = MLSignalStrategy(model_path)
+entries, exits, probs = ml_strategy.generate_signals(features)
+
+# Backtest
+pf, metrics = run_vectorbt_backtest(features, entries, exits, results_dir, symbol)
+logger.info('Backtest metrics: %s', metrics)
+
+if __name__ == '__main__':
+main()
+```
+
+scripts/train_model.py
+```
+from src.features.engineer import load_parquet, add_basic_features, add_ml_labels
+from src.ml.train import train_model
+import yaml
+from src.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+def main():
+cfg = yaml.safe_load(open('config/config.yaml'))
+# For training, use first symbol parquet from data dir
+exchange = cfg['exchange']
+symbol = cfg['symbols'][0]
+timeframe = cfg['timeframe']
+path = f"{cfg['data_dir']}/{exchange}/{symbol.replace('/','-')}/{timeframe}.parquet"
+df = load_parquet(path)
+features = add_basic_features(df, sma_short=cfg['sma_short'], sma_long=cfg['sma_long'])
+features = add_ml_labels(features, horizon=cfg['ml']['label_horizon'])
+model_path, metrics = train_model(path, config_path='config/config.yaml')
+logger.info('Training complete. Model path: %s', model_path)
+
+if __name__ == '__main__':
+main()
+```
+
+tests/test_features.py
+```
+import pandas as pd
+import numpy as np
+from src.features.engineer import add_basic_features, add_ml_labels
+
+def test_basic_features_and_labels():
+idx = pd.date_range('2020-01-01', periods=300, freq='H')
+prices = 100 + np.random.randn(len(idx)).cumsum()
+df = pd.DataFrame({'close': prices}, index=idx)
+out = add_basic_features(df, sma_short=5, sma_long=20)
+out = add_ml_labels(out, horizon=1)
+assert 'sma_short' in out.columns
+assert 'sma_long' in out.columns
+assert 'direction' in out.columns
+assert not out.isnull().values.any()
+```
